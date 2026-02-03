@@ -15,6 +15,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TUI_DEMO="$SCRIPT_DIR/tui-demo"
 OUTPUT_DIR="$REPO_ROOT/docs/images"
+DEMO_COLS=140
+DEMO_ROWS=40
+DEMO_THEME="dracula"
+DEMO_FONT_SIZE=10
+DEMO_ARGS=(--cols "$DEMO_COLS" --rows "$DEMO_ROWS" --theme "$DEMO_THEME" --font-size "$DEMO_FONT_SIZE")
 
 # Ensure we're in an example directory
 if [[ ! -f "pacabench.yaml" ]]; then
@@ -35,10 +40,14 @@ echo "Recording README demos..."
 echo "Output: $OUTPUT_DIR"
 echo ""
 
+# Ensure colors are enabled in recorded output.
+unset NO_COLOR
+
 # Demo 1: Running a benchmark with --limit
 echo "==> Recording: simple-run.gif (pacabench run --limit 15)"
 "$TUI_DEMO" \
     -o "$OUTPUT_DIR/simple-run.gif" \
+    "${DEMO_ARGS[@]}" \
     --pause 3 \
     -- "pacabench run --limit 15"
 
@@ -48,6 +57,7 @@ echo ""
 echo "==> Recording: simple-show.gif (pacabench show)"
 "$TUI_DEMO" \
     -o "$OUTPUT_DIR/simple-show.gif" \
+    "${DEMO_ARGS[@]}" \
     --pause 2.5 \
     -- "pacabench show"
 
@@ -63,11 +73,12 @@ if [[ -z "$LATEST_RUN" ]]; then
     exit 1
 fi
 
-# Use a short ID if possible (first 8 chars of the unique part)
-SHORT_ID=$(echo "$LATEST_RUN" | sed 's/.*-//' | cut -c1-8)
+# Use the last 8 chars of the run id (nanoid can include hyphens)
+SHORT_ID="${LATEST_RUN: -8}"
 
 "$TUI_DEMO" \
     -o "$OUTPUT_DIR/simple-show-detail.gif" \
+    "${DEMO_ARGS[@]}" \
     --pause 2.5 \
     -- "pacabench show $SHORT_ID"
 

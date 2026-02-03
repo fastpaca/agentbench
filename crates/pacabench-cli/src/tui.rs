@@ -94,8 +94,7 @@ impl TuiDisplay {
     }
 
     pub fn is_supported() -> bool {
-        let term = std::env::var("TERM").ok();
-        io::stdout().is_terminal() && term.as_deref() != Some("dumb")
+        io::stdout().is_terminal()
     }
 
     pub async fn run(mut self, mut rx: broadcast::Receiver<Event>) -> Result<()> {
