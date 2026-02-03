@@ -4,13 +4,15 @@
 //! Receives events via tokio channel and updates the display.
 //! Cost is computed here using pricing tables from the pricing module.
 
-use crate::formatting::print_run_stats;
+use crate::formatting::{print_run_stats, RunDistributions};
 use crate::pricing::{calculate_cost, calculate_cost_from_metrics};
 use console::style;
 use dashmap::DashMap;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use pacabench_core::persistence::RunStore;
 use pacabench_core::Event;
 use parking_lot::Mutex;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::broadcast;
@@ -32,6 +34,8 @@ struct AgentState {
     cost_micros: AtomicU64,
     // Tracks dataset:case_id so retries/resumes don't double-increment the bar.
     cases: DashMap<String, CaseOutcome>,
+    // Tracks cost per case so retries replace prior cost instead of double counting.
+    case_costs: DashMap<String, u64>,
 }
 
 impl AgentState {
@@ -43,12 +47,8 @@ impl AgentState {
             errors: AtomicU64::new(0),
             cost_micros: AtomicU64::new(0),
             cases: DashMap::new(),
+            case_costs: DashMap::new(),
         }
-    }
-
-    fn add_cost(&self, usd: f64) {
-        let micros = (usd * MICRODOLLARS_PER_USD) as u64;
-        self.cost_micros.fetch_add(micros, Ordering::Relaxed);
     }
 
     fn cost_usd(&self) -> f64 {
@@ -110,7 +110,7 @@ impl AgentState {
         true
     }
 
-    fn record_case(&self, key: &str, outcome: CaseOutcome) {
+    fn record_case(&self, key: &str, outcome: CaseOutcome, cost_micros: u64) {
         let prev = self.cases.get(key).map(|v| *v.value());
         let changed = self.adjust_counters(prev, outcome);
         if prev.is_none() {
@@ -121,6 +121,15 @@ impl AgentState {
         if changed {
             self.cases.insert(key.to_string(), outcome);
         }
+
+        self.update_case_cost(key, cost_micros);
+    }
+
+    fn update_case_cost(&self, key: &str, cost_micros: u64) {
+        if let Some(prev) = self.case_costs.insert(key.to_string(), cost_micros) {
+            self.cost_micros.fetch_sub(prev, Ordering::Relaxed);
+        }
+        self.cost_micros.fetch_add(cost_micros, Ordering::Relaxed);
     }
 }
 
@@ -129,20 +138,22 @@ pub struct ProgressDisplay {
     multi: MultiProgress,
     agents: DashMap<String, AgentState>,
     start_time: Mutex<Option<Instant>>,
+    runs_dir: PathBuf,
 }
 
 impl Default for ProgressDisplay {
     fn default() -> Self {
-        Self::new()
+        Self::new(PathBuf::from("."))
     }
 }
 
 impl ProgressDisplay {
-    pub fn new() -> Self {
+    pub fn new(runs_dir: PathBuf) -> Self {
         Self {
             multi: MultiProgress::new(),
             agents: DashMap::new(),
             start_time: Mutex::new(None),
+            runs_dir,
         }
     }
 
@@ -276,7 +287,6 @@ impl ProgressDisplay {
                     };
 
                     let key = format!("{dataset}:{case_id}");
-                    state.value().record_case(&key, outcome);
 
                     // Use model-aware pricing; fallback to default model if missing
                     let model_name = model.as_deref().unwrap_or("gpt-4o-mini");
@@ -308,7 +318,10 @@ impl ProgressDisplay {
                         default_judge_cost
                     };
 
-                    state.value().add_cost(agent_cost + judge_cost);
+                    let total_cost = agent_cost + judge_cost;
+                    let total_micros = (total_cost * MICRODOLLARS_PER_USD) as u64;
+                    state.value().record_case(&key, outcome, total_micros);
+
                     state.value().update_message(*self.start_time.lock());
                 }
             }
@@ -325,11 +338,15 @@ impl ProgressDisplay {
 
             Event::RunCompleted { aborted, stats } => {
                 for entry in self.agents.iter() {
-                    entry.value().bar.finish_and_clear();
+                    entry.value().bar.finish();
                 }
 
-                // Use the canonical display from formatting module
-                print_run_stats(&stats);
+                let distributions = RunStore::new(self.runs_dir.join(&stats.run_id))
+                    .ok()
+                    .and_then(|store| store.load_results().ok())
+                    .map(|results| RunDistributions::from_results(&results));
+
+                print_run_stats(&stats, distributions.as_ref());
 
                 if aborted {
                     println!(

@@ -3,24 +3,72 @@
 //! All formatting functions should take [`RunStats`] as input - the single
 //! source of truth for all run metrics. Do not re-aggregate from raw results.
 
-use crate::pricing::calculate_cost_from_tokens;
+use crate::pricing::{calculate_cost, calculate_cost_from_metrics, calculate_cost_from_tokens};
 use console::style;
 use pacabench_core::persistence::{ErrorEntry, RunSummary};
 use pacabench_core::stats::RunStats;
 use pacabench_core::types::ErrorType;
 use pacabench_core::CaseResult;
 
-/// Print a k6-style metric line with dots as separator
-fn print_metric(name: &str, value: &str) {
-    let width: usize = 20;
-    let dots = ".".repeat(width.saturating_sub(name.len()));
-    println!("     {}{} {}", style(name).cyan(), style(dots).dim(), value);
+fn indent_line(mut spans: StyledLine) -> StyledLine {
+    let mut line = Vec::with_capacity(spans.len() + 1);
+    line.push(span("     ", style_default()));
+    line.append(&mut spans);
+    line
 }
 
-/// Print a k6-style section header
-fn print_section(name: &str) {
-    println!();
-    println!("     {}", style(name).magenta().bold());
+fn section_line(name: &str) -> StyledLine {
+    indent_line(vec![span(name, style_magenta_bold())])
+}
+
+fn metric_line(name: &str, value: StyledLine) -> StyledLine {
+    let width: usize = 20;
+    let dots = ".".repeat(width.saturating_sub(name.len()));
+    let mut spans = Vec::new();
+    spans.push(span(name, style_cyan()));
+    spans.push(span(dots, style_dim()));
+    spans.push(span(" ", style_default()));
+    spans.extend(value);
+    indent_line(spans)
+}
+
+fn histogram_lines(label: &str, buckets: &[(String, u64)]) -> Vec<StyledLine> {
+    let mut lines = Vec::new();
+    lines.push(indent_line(vec![span(label, style_cyan())]));
+    if buckets.is_empty() {
+        lines.push(indent_line(vec![span("no data", style_dim())]));
+        return lines;
+    }
+
+    let max_count = buckets.iter().map(|(_, count)| *count).max().unwrap_or(0);
+    let bar_width = 24usize;
+    let label_width = buckets
+        .iter()
+        .map(|(bucket_label, _)| bucket_label.len())
+        .max()
+        .unwrap_or(0);
+
+    for (bucket_label, count) in buckets {
+        let filled = if max_count == 0 {
+            0
+        } else {
+            ((count.saturating_mul(bar_width as u64) as f64 / max_count as f64).round() as usize)
+                .min(bar_width)
+        };
+        let empty = bar_width.saturating_sub(filled);
+        let bar = "█".repeat(filled);
+        let pad = "░".repeat(empty);
+
+        lines.push(indent_line(vec![
+            span(format!("{:>label_width$}", bucket_label), style_dim()),
+            span(" | ", style_default()),
+            span(bar, style_cyan()),
+            span(pad, style_dim()),
+            span(format!(" {}", count), style_default()),
+        ]));
+    }
+
+    lines
 }
 
 // Show command formatting
@@ -81,12 +129,13 @@ fn format_number(n: u64) -> String {
     result
 }
 
-/// Print run details from RunStats - k6 style output.
-pub fn print_run_stats(stats: &RunStats) {
+pub fn build_run_stats_view(
+    stats: &RunStats,
+    distributions: Option<&RunDistributions>,
+) -> Vec<StyledLine> {
     let cost = calculate_cost_from_tokens(&stats.tokens);
+    let mut lines: Vec<StyledLine> = Vec::new();
 
-    // Header
-    println!();
     let status_text = match stats.status {
         pacabench_core::RunStatus::Completed => "COMPLETED",
         pacabench_core::RunStatus::Aborted => "ABORTED",
@@ -96,135 +145,203 @@ pub fn print_run_stats(stats: &RunStats) {
         pacabench_core::RunStatus::Pending => "PENDING",
         pacabench_core::RunStatus::Finalizing => "FINALIZING",
     };
-    let status_styled = match stats.status {
-        pacabench_core::RunStatus::Completed => style(status_text).green().bold(),
-        pacabench_core::RunStatus::Aborted | pacabench_core::RunStatus::Failed => {
-            style(status_text).red().bold()
-        }
-        _ => style(status_text).yellow(),
+    let status_style = match stats.status {
+        pacabench_core::RunStatus::Completed => style_green_bold(),
+        pacabench_core::RunStatus::Aborted | pacabench_core::RunStatus::Failed => style_red_bold(),
+        _ => style_yellow(),
     };
-    println!(
-        "     {} {}",
-        style(&stats.run_id).bold().cyan(),
-        status_styled
-    );
+
+    lines.push(Vec::new());
+    lines.push(indent_line(vec![
+        span(stats.run_id.clone(), style_cyan_bold()),
+        span(" ", style_default()),
+        span(status_text, status_style),
+    ]));
+
     if let Some(retry) = &stats.retry_of {
-        println!("     {} {}", style("retry of:").dim(), retry);
+        lines.push(indent_line(vec![
+            span("retry of:", style_dim()),
+            span(" ", style_default()),
+            span(retry.clone(), style_default()),
+        ]));
     }
 
     if stats.completed_cases == 0 {
-        println!();
-        println!("     No results yet.");
-        println!();
-        return;
+        lines.push(Vec::new());
+        lines.push(indent_line(vec![span("No results yet.", style_default())]));
+        lines.push(Vec::new());
+        return lines;
     }
 
-    // Accuracy with visual bar
     let acc_pct = stats.accuracy * 100.0;
     let bar_width = 20;
     let filled = ((stats.accuracy * bar_width as f64).round() as usize).min(bar_width);
     let empty = bar_width - filled;
     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
-    let acc_colored = if acc_pct >= 80.0 {
-        style(format!("{:.1}%", acc_pct)).green()
+    let acc_style = if acc_pct >= 80.0 {
+        style_green_bold()
     } else if acc_pct >= 50.0 {
-        style(format!("{:.1}%", acc_pct)).yellow()
+        SpanStyle {
+            fg: Some(SpanColor::Yellow),
+            bold: true,
+            ..SpanStyle::default()
+        }
     } else {
-        style(format!("{:.1}%", acc_pct)).red()
+        style_red_bold()
     };
 
-    print_section("results");
-    print_metric(
+    lines.push(Vec::new());
+    lines.push(section_line("results"));
+    lines.push(metric_line(
         "accuracy",
-        &format!(
-            "{} {}  passed={}  failed={}",
-            style(bar).cyan(),
-            acc_colored,
-            style(stats.passed_cases).green(),
-            style(stats.failed_cases).red()
-        ),
-    );
-    print_metric(
+        vec![
+            span(bar, style_cyan()),
+            span(" ", style_default()),
+            span(format!("{:.1}%", acc_pct), acc_style),
+            span("  passed=", style_default()),
+            span(stats.passed_cases.to_string(), style_green_bold()),
+            span("  failed=", style_default()),
+            span(stats.failed_cases.to_string(), style_red_bold()),
+        ],
+    ));
+    lines.push(metric_line(
         "cases",
-        &format!("{}/{}", stats.completed_cases, stats.planned_cases),
-    );
+        vec![span(
+            format!("{}/{}", stats.completed_cases, stats.planned_cases),
+            style_default(),
+        )],
+    ));
 
-    print_section("performance");
-    print_metric(
+    lines.push(Vec::new());
+    lines.push(section_line("performance"));
+    lines.push(metric_line(
         "duration",
-        &format!(
-            "p50={} p95={}",
-            format_duration_ms(stats.metrics.p50_duration_ms),
-            format_duration_ms(stats.metrics.p95_duration_ms)
-        ),
-    );
-    print_metric(
+        vec![span(
+            format!(
+                "p50={} p95={}",
+                format_duration_ms(stats.metrics.p50_duration_ms),
+                format_duration_ms(stats.metrics.p95_duration_ms)
+            ),
+            style_default(),
+        )],
+    ));
+    lines.push(metric_line(
         "llm_latency",
-        &format!(
-            "avg={} p50={} p95={}",
-            format_duration_ms(stats.metrics.avg_llm_latency_ms),
-            format_duration_ms(stats.metrics.p50_llm_latency_ms),
-            format_duration_ms(stats.metrics.p95_llm_latency_ms)
-        ),
-    );
-    print_metric(
+        vec![span(
+            format!(
+                "avg={} p50={} p95={}",
+                format_duration_ms(stats.metrics.avg_llm_latency_ms),
+                format_duration_ms(stats.metrics.p50_llm_latency_ms),
+                format_duration_ms(stats.metrics.p95_llm_latency_ms)
+            ),
+            style_default(),
+        )],
+    ));
+    lines.push(metric_line(
         "attempts",
-        &format!(
-            "avg={:.1} max={}",
-            stats.metrics.avg_attempts, stats.metrics.max_attempts
-        ),
-    );
+        vec![span(
+            format!(
+                "avg={:.1} max={}",
+                stats.metrics.avg_attempts, stats.metrics.max_attempts
+            ),
+            style_default(),
+        )],
+    ));
 
-    print_section("tokens");
-    print_metric(
-        "agent_input",
-        &format_number(stats.tokens.agent_input_tokens),
-    );
-    print_metric(
-        "agent_output",
-        &format_number(stats.tokens.agent_output_tokens),
-    );
-    print_metric("llm_calls", &stats.tokens.agent_calls.to_string());
-
-    if stats.tokens.judge_input_tokens > 0 || stats.tokens.judge_output_tokens > 0 {
-        print_metric(
-            "judge_input",
-            &format_number(stats.tokens.judge_input_tokens),
-        );
-        print_metric(
-            "judge_output",
-            &format_number(stats.tokens.judge_output_tokens),
-        );
+    if let Some(distributions) = distributions {
+        lines.push(Vec::new());
+        lines.push(section_line("distributions"));
+        lines.extend(histogram_lines("duration", distributions.duration()));
+        lines.extend(histogram_lines("cost", distributions.cost()));
     }
 
-    print_section("cost");
-    print_metric("total", &format!("${:.4}", cost.total_cost_usd));
-    print_metric("agent", &format!("${:.4}", cost.agent_cost_usd));
-    print_metric("judge", &format!("${:.4}", cost.judge_cost_usd));
+    lines.push(Vec::new());
+    lines.push(section_line("tokens"));
+    lines.push(metric_line(
+        "agent_input",
+        vec![span(
+            format_number(stats.tokens.agent_input_tokens),
+            style_default(),
+        )],
+    ));
+    lines.push(metric_line(
+        "agent_output",
+        vec![span(
+            format_number(stats.tokens.agent_output_tokens),
+            style_default(),
+        )],
+    ));
+    lines.push(metric_line(
+        "llm_calls",
+        vec![span(stats.tokens.agent_calls.to_string(), style_default())],
+    ));
+    if stats.tokens.judge_input_tokens > 0 || stats.tokens.judge_output_tokens > 0 {
+        lines.push(metric_line(
+            "judge_input",
+            vec![span(
+                format_number(stats.tokens.judge_input_tokens),
+                style_default(),
+            )],
+        ));
+        lines.push(metric_line(
+            "judge_output",
+            vec![span(
+                format_number(stats.tokens.judge_output_tokens),
+                style_default(),
+            )],
+        ));
+    }
 
+    lines.push(Vec::new());
+    lines.push(section_line("cost"));
+    lines.push(metric_line(
+        "total",
+        vec![span(
+            format!("${:.4}", cost.total_cost_usd),
+            style_default(),
+        )],
+    ));
+    lines.push(metric_line(
+        "agent",
+        vec![span(
+            format!("${:.4}", cost.agent_cost_usd),
+            style_default(),
+        )],
+    ));
+    lines.push(metric_line(
+        "judge",
+        vec![span(
+            format!("${:.4}", cost.judge_cost_usd),
+            style_default(),
+        )],
+    ));
     if !stats.tokens.models_used.is_empty() {
-        print_metric("models", &stats.tokens.models_used.join(", "));
+        lines.push(metric_line(
+            "models",
+            vec![span(stats.tokens.models_used.join(", "), style_default())],
+        ));
     }
 
     if stats.system_error_count > 0 || stats.fatal_error_count > 0 {
-        print_section("errors");
+        lines.push(Vec::new());
+        lines.push(section_line("errors"));
         if stats.system_error_count > 0 {
-            print_metric(
+            lines.push(metric_line(
                 "system_errors",
-                &style(stats.system_error_count).yellow().to_string(),
-            );
+                vec![span(stats.system_error_count.to_string(), style_yellow())],
+            ));
         }
         if stats.fatal_error_count > 0 {
-            print_metric(
+            lines.push(metric_line(
                 "fatal_errors",
-                &style(stats.fatal_error_count).red().to_string(),
-            );
+                vec![span(stats.fatal_error_count.to_string(), style_red_bold())],
+            ));
         }
     }
 
-    // Agents
     if !stats.by_agent.is_empty() {
-        print_section("agents");
+        lines.push(Vec::new());
+        lines.push(section_line("agents"));
 
         let mut agents: Vec<_> = stats.by_agent.values().collect();
         agents.sort_by(|a, b| {
@@ -236,31 +353,48 @@ pub fn print_run_stats(stats: &RunStats) {
         for agent in agents {
             let agent_cost = calculate_cost_from_tokens(&agent.tokens);
             let acc = agent.accuracy * 100.0;
-            let acc_styled = if acc >= 80.0 {
-                style(format!("{:.1}%", acc)).green()
+            let acc_style = if acc >= 80.0 {
+                style_green_bold()
             } else if acc >= 50.0 {
-                style(format!("{:.1}%", acc)).yellow()
+                SpanStyle {
+                    fg: Some(SpanColor::Yellow),
+                    bold: true,
+                    ..SpanStyle::default()
+                }
             } else {
-                style(format!("{:.1}%", acc)).red()
+                style_red_bold()
             };
-            print_metric(
+            lines.push(metric_line(
                 &agent.agent_name,
-                &format!(
-                    "{}  passed={}  failed={}  p50={}  ${:.4}",
-                    acc_styled,
-                    style(agent.passed_cases).green(),
-                    style(agent.failed_cases).red(),
-                    format_duration_ms(agent.metrics.p50_duration_ms),
-                    agent_cost.total_cost_usd
-                ),
-            );
+                vec![
+                    span(format!("{:.1}%", acc), acc_style),
+                    span("  passed=", style_default()),
+                    span(agent.passed_cases.to_string(), style_green_bold()),
+                    span("  failed=", style_default()),
+                    span(agent.failed_cases.to_string(), style_red_bold()),
+                    span(
+                        format!(
+                            "  p50={}",
+                            format_duration_ms(agent.metrics.p50_duration_ms)
+                        ),
+                        style_default(),
+                    ),
+                    span(
+                        format!("  ${:.4}", agent_cost.total_cost_usd),
+                        style_default(),
+                    ),
+                ],
+            ));
         }
     }
 
-    // Failures
     if !stats.failures.is_empty() {
-        print_section(&format!("failures ({})", stats.failures.len()));
-        println!();
+        lines.push(Vec::new());
+        lines.push(section_line(&format!(
+            "failures ({})",
+            stats.failures.len()
+        )));
+        lines.push(Vec::new());
 
         for failure in stats.failures.iter().take(10) {
             let reason = if failure.reason.len() > 60 {
@@ -268,22 +402,290 @@ pub fn print_run_stats(stats: &RunStats) {
             } else {
                 failure.reason.clone()
             };
-            println!(
-                "     {} {}",
-                style(format!("{}/{}", failure.agent_name, failure.case_id)).white(),
-                style(reason).dim()
-            );
+            lines.push(indent_line(vec![
+                span(
+                    format!("{}/{}", failure.agent_name, failure.case_id),
+                    style_white(),
+                ),
+                span(" ", style_default()),
+                span(reason, style_dim()),
+            ]));
         }
         if stats.failures.len() > 10 {
-            println!(
-                "     {} {}",
-                style("...").dim(),
-                style(format!("and {} more", stats.failures.len() - 10)).dim()
-            );
+            lines.push(indent_line(vec![
+                span("...", style_dim()),
+                span(
+                    format!(" and {} more", stats.failures.len() - 10),
+                    style_dim(),
+                ),
+            ]));
         }
     }
 
-    println!();
+    lines.push(Vec::new());
+    lines
+}
+
+const DURATION_BUCKETS: &[(f64, &str)] = &[
+    (100.0, "0-100ms"),
+    (250.0, "100-250ms"),
+    (500.0, "250-500ms"),
+    (1000.0, "0.5-1s"),
+    (2000.0, "1-2s"),
+    (5000.0, "2-5s"),
+    (10_000.0, "5-10s"),
+    (20_000.0, "10-20s"),
+    (40_000.0, "20-40s"),
+    (f64::INFINITY, "40s+"),
+];
+const COST_BUCKETS: &[(f64, &str)] = &[
+    (0.0001, "<$0.0001"),
+    (0.0005, "$0.0001-0.0005"),
+    (0.001, "$0.0005-0.001"),
+    (0.005, "$0.001-0.005"),
+    (0.01, "$0.005-0.01"),
+    (0.05, "$0.01-0.05"),
+    (0.1, "$0.05-0.1"),
+    (0.5, "$0.1-0.5"),
+    (f64::INFINITY, "$0.5+"),
+];
+
+#[derive(Debug, Clone)]
+pub struct RunDistributions {
+    duration: Vec<(String, u64)>,
+    cost: Vec<(String, u64)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanColor {
+    Green,
+    Red,
+    Yellow,
+    Cyan,
+    Magenta,
+    White,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpanStyle {
+    pub fg: Option<SpanColor>,
+    pub bold: bool,
+    pub dim: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StyledSpan {
+    pub text: String,
+    pub style: SpanStyle,
+}
+
+pub type StyledLine = Vec<StyledSpan>;
+
+fn span(text: impl Into<String>, style: SpanStyle) -> StyledSpan {
+    StyledSpan {
+        text: text.into(),
+        style,
+    }
+}
+
+fn style_default() -> SpanStyle {
+    SpanStyle::default()
+}
+
+fn style_dim() -> SpanStyle {
+    SpanStyle {
+        dim: true,
+        ..SpanStyle::default()
+    }
+}
+
+fn style_cyan() -> SpanStyle {
+    SpanStyle {
+        fg: Some(SpanColor::Cyan),
+        ..SpanStyle::default()
+    }
+}
+
+fn style_cyan_bold() -> SpanStyle {
+    SpanStyle {
+        fg: Some(SpanColor::Cyan),
+        bold: true,
+        ..SpanStyle::default()
+    }
+}
+
+fn style_green_bold() -> SpanStyle {
+    SpanStyle {
+        fg: Some(SpanColor::Green),
+        bold: true,
+        ..SpanStyle::default()
+    }
+}
+
+fn style_red_bold() -> SpanStyle {
+    SpanStyle {
+        fg: Some(SpanColor::Red),
+        bold: true,
+        ..SpanStyle::default()
+    }
+}
+
+fn style_yellow() -> SpanStyle {
+    SpanStyle {
+        fg: Some(SpanColor::Yellow),
+        ..SpanStyle::default()
+    }
+}
+
+fn style_magenta_bold() -> SpanStyle {
+    SpanStyle {
+        fg: Some(SpanColor::Magenta),
+        bold: true,
+        ..SpanStyle::default()
+    }
+}
+
+fn style_white() -> SpanStyle {
+    SpanStyle {
+        fg: Some(SpanColor::White),
+        ..SpanStyle::default()
+    }
+}
+
+impl RunDistributions {
+    pub fn from_results(results: &[CaseResult]) -> Self {
+        let mut duration_counts = vec![0u64; DURATION_BUCKETS.len()];
+        let mut cost_counts = vec![0u64; COST_BUCKETS.len()];
+
+        for result in results {
+            let idx = duration_bucket_index(result.runner_duration_ms);
+            if let Some(slot) = duration_counts.get_mut(idx) {
+                *slot = slot.saturating_add(1);
+            }
+
+            let cost_idx = cost_bucket_index(case_cost_usd(result));
+            if let Some(slot) = cost_counts.get_mut(cost_idx) {
+                *slot = slot.saturating_add(1);
+            }
+        }
+
+        let duration = DURATION_BUCKETS
+            .iter()
+            .zip(duration_counts)
+            .map(|((_, label), count)| (label.to_string(), count))
+            .collect();
+        let cost = COST_BUCKETS
+            .iter()
+            .zip(cost_counts)
+            .map(|((_, label), count)| (label.to_string(), count))
+            .collect();
+
+        Self { duration, cost }
+    }
+
+    fn duration(&self) -> &[(String, u64)] {
+        &self.duration
+    }
+
+    fn cost(&self) -> &[(String, u64)] {
+        &self.cost
+    }
+}
+
+fn duration_bucket_index(duration_ms: f64) -> usize {
+    let value = if duration_ms.is_finite() && duration_ms > 0.0 {
+        duration_ms
+    } else {
+        0.0
+    };
+    DURATION_BUCKETS
+        .iter()
+        .position(|(bound, _)| value <= *bound)
+        .unwrap_or_else(|| DURATION_BUCKETS.len().saturating_sub(1))
+}
+
+fn cost_bucket_index(cost_usd: f64) -> usize {
+    let value = if cost_usd.is_finite() && cost_usd >= 0.0 {
+        cost_usd
+    } else {
+        0.0
+    };
+    COST_BUCKETS
+        .iter()
+        .position(|(bound, _)| value <= *bound)
+        .unwrap_or_else(|| COST_BUCKETS.len().saturating_sub(1))
+}
+
+fn case_cost_usd(result: &CaseResult) -> f64 {
+    let agent_model = result.llm_metrics.model.as_deref();
+    let agent_cost = match agent_model {
+        Some(model) => calculate_cost(
+            model,
+            result.llm_metrics.input_tokens,
+            result.llm_metrics.output_tokens,
+            result.llm_metrics.cached_tokens,
+        ),
+        None => calculate_cost_from_metrics(
+            result.llm_metrics.input_tokens,
+            result.llm_metrics.output_tokens,
+            result.llm_metrics.cached_tokens,
+        ),
+    };
+
+    let judge_cost = result
+        .judge_metrics
+        .as_ref()
+        .map(|judge| {
+            let model = judge.model.as_deref().or(agent_model);
+            match model {
+                Some(model) => calculate_cost(
+                    model,
+                    judge.input_tokens,
+                    judge.output_tokens,
+                    judge.cached_tokens,
+                ),
+                None => calculate_cost_from_metrics(
+                    judge.input_tokens,
+                    judge.output_tokens,
+                    judge.cached_tokens,
+                ),
+            }
+        })
+        .unwrap_or(0.0);
+
+    agent_cost + judge_cost
+}
+
+/// Print run details from RunStats - k6 style output.
+pub fn print_run_stats(stats: &RunStats, distributions: Option<&RunDistributions>) {
+    let lines = build_run_stats_view(stats, distributions);
+    for line in lines {
+        if line.is_empty() {
+            println!();
+            continue;
+        }
+        for span in line {
+            let mut styled = style(span.text);
+            if let Some(color) = span.style.fg {
+                styled = match color {
+                    SpanColor::Green => styled.green(),
+                    SpanColor::Red => styled.red(),
+                    SpanColor::Yellow => styled.yellow(),
+                    SpanColor::Cyan => styled.cyan(),
+                    SpanColor::Magenta => styled.magenta(),
+                    SpanColor::White => styled.white(),
+                };
+            }
+            if span.style.bold {
+                styled = styled.bold();
+            }
+            if span.style.dim {
+                styled = styled.dim();
+            }
+            print!("{}", styled);
+        }
+        println!();
+    }
 }
 
 /// Export schema version.
