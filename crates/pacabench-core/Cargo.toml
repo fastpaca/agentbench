@@ -1,6 +1,6 @@
 [package]
 name = "pacabench-core"
-version = "0.0.1"
+version = "0.0.3"
 edition = "2021"
 description = "Core library for PacaBench - a benchmark harness for LLM agents"
 license = "Apache-2.0"
