@@ -30,7 +30,7 @@
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/fastpaca/pacabench/main/docs/images/simple-run.gif" width="800">
+  <img src="https://raw.githubusercontent.com/fastpaca/pacabench/main/docs/images/simple-run.gif" width="800" alt="Live run TUI with distributions and rolling failures">
 </p>
 
 ---
@@ -93,8 +93,9 @@ pacabench run --limit 10
 ```
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/fastpaca/pacabench/main/docs/images/simple-run.gif" width="800">
+  <img src="https://raw.githubusercontent.com/fastpaca/pacabench/main/docs/images/simple-run.gif" width="800" alt="Live run TUI with distributions and rolling failures">
 </p>
+<p align="center"><em>Live run summary with distributions and a rolling failures log.</em></p>
 
 See all runs:
 
@@ -103,8 +104,9 @@ pacabench show
 ```
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/fastpaca/pacabench/main/docs/images/simple-show.gif" width="800">
+  <img src="https://raw.githubusercontent.com/fastpaca/pacabench/main/docs/images/simple-show.gif" width="800" alt="List of recent runs">
 </p>
+<p align="center"><em>Run list overview.</em></p>
 
 Drill into a specific run:
 
@@ -115,8 +117,9 @@ pacabench show <run-id> --failures
 ```
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/fastpaca/pacabench/main/docs/images/simple-show-detail.gif" width="800">
+  <img src="https://raw.githubusercontent.com/fastpaca/pacabench/main/docs/images/simple-show-detail.gif" width="800" alt="Run summary with distributions, costs, and failures">
 </p>
+<p align="center"><em>Run summary with distributions, cost breakdowns, and failures.</em></p>
 
 
 Retry failures:

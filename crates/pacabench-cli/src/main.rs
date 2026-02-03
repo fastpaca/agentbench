@@ -4,12 +4,13 @@ mod formatting;
 mod init;
 mod pricing;
 mod progress;
+mod tui;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use formatting::{
     build_export_json_from_stats, build_export_markdown_from_stats, print_cases, print_run_list,
-    print_run_stats,
+    print_run_stats, RunDistributions,
 };
 use pacabench_core::config::ConfigOverrides;
 use pacabench_core::persistence::{list_run_summaries, RunStore, RunSummary};
@@ -20,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tui::TuiDisplay;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -60,6 +62,12 @@ enum Command {
         /// Override timeout in seconds.
         #[arg(long)]
         timeout: Option<f64>,
+        /// Force the TUI progress display.
+        #[arg(long)]
+        tui: bool,
+        /// Disable the TUI progress display.
+        #[arg(long, conflicts_with = "tui")]
+        no_tui: bool,
     },
 
     /// Show aggregated metrics for a run id.
@@ -89,6 +97,12 @@ enum Command {
         runs_dir: Option<String>,
         #[arg(long)]
         limit: Option<usize>,
+        /// Force the TUI progress display.
+        #[arg(long)]
+        tui: bool,
+        /// Disable the TUI progress display.
+        #[arg(long, conflicts_with = "tui")]
+        no_tui: bool,
     },
 
     /// Export results to JSON or Markdown.
@@ -167,8 +181,10 @@ fn main() -> Result<()> {
             limit,
             run_id,
             agents,
+            tui,
+            no_tui,
             ..
-        }) => cmd_run(&mut config, run_id, limit, agents)?,
+        }) => cmd_run(&mut config, run_id, limit, agents, tui, no_tui)?,
         Some(Command::Show {
             run_id,
             runs_dir,
@@ -180,7 +196,9 @@ fn main() -> Result<()> {
             run_id,
             runs_dir,
             limit,
-        }) => cmd_retry(&mut config, &run_id, runs_dir, limit)?,
+            tui,
+            no_tui,
+        }) => cmd_retry(&mut config, &run_id, runs_dir, limit, tui, no_tui)?,
         Some(Command::Export {
             run_id,
             format,
@@ -224,6 +242,8 @@ fn cmd_run(
     run_id: Option<String>,
     limit: Option<usize>,
     agents: Option<String>,
+    tui: bool,
+    no_tui: bool,
 ) -> Result<()> {
     // Filter agents if specified
     if let Some(agents_filter) = agents {
@@ -253,7 +273,8 @@ fn cmd_run(
     }
 
     let bench = Benchmark::new(config.clone());
-    run_benchmark_with_progress(bench, run_id, limit)
+    let display_mode = resolve_display_mode(tui, no_tui)?;
+    run_benchmark_with_progress(bench, run_id, limit, display_mode, config.runs_dir.clone())
 }
 
 fn cmd_show(
@@ -283,13 +304,13 @@ fn cmd_show(
         .load_stats()
         .with_context(|| format!("loading stats for {}", resolved_id))?;
 
-    print_run_stats(&stats);
+    let results = store
+        .load_results()
+        .with_context(|| format!("loading results for {}", resolved_id))?;
+    let distributions = RunDistributions::from_results(&results);
+    print_run_stats(&stats, Some(&distributions));
 
     if cases {
-        // For case-level display, we still need the raw data
-        let results = store
-            .load_results()
-            .with_context(|| format!("loading results for {}", resolved_id))?;
         let errors = store
             .load_errors()
             .with_context(|| format!("loading errors for {}", resolved_id))?;
@@ -304,6 +325,8 @@ fn cmd_retry(
     run_id: &str,
     runs_dir: Option<String>,
     limit: Option<usize>,
+    tui: bool,
+    no_tui: bool,
 ) -> Result<()> {
     if let Some(dir) = runs_dir {
         config.runs_dir = PathBuf::from(dir);
@@ -328,7 +351,14 @@ fn cmd_retry(
     );
 
     let bench = Benchmark::new(config.clone());
-    run_benchmark_with_progress(bench, Some(resolved_id), limit)
+    let display_mode = resolve_display_mode(tui, no_tui)?;
+    run_benchmark_with_progress(
+        bench,
+        Some(resolved_id),
+        limit,
+        display_mode,
+        config.runs_dir.clone(),
+    )
 }
 
 fn cmd_export(
@@ -447,13 +477,26 @@ fn run_benchmark_with_progress(
     bench: Benchmark,
     run_id: Option<String>,
     limit: Option<usize>,
+    display_mode: DisplayMode,
+    runs_dir: PathBuf,
 ) -> Result<()> {
     let events = bench.subscribe();
     let cmd_tx = bench.command_sender();
     let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
     rt.block_on(async {
-        let display = ProgressDisplay::new();
-        let display_handle = tokio::spawn(display.run(events));
+        let display_handle = match display_mode {
+            DisplayMode::Tui => {
+                let display = TuiDisplay::new(runs_dir.clone());
+                tokio::spawn(async move { display.run(events).await })
+            }
+            DisplayMode::Progress => {
+                let display = ProgressDisplay::new(runs_dir);
+                tokio::spawn(async move {
+                    display.run(events).await;
+                    Ok(())
+                })
+            }
+        };
 
         // Spawn signal handler
         let signal_handle = tokio::spawn(handle_signals(cmd_tx));
@@ -463,12 +506,47 @@ fn run_benchmark_with_progress(
         // Abort signal handler since benchmark is done
         signal_handle.abort();
 
-        let _ = display_handle.await;
-        result
+        let display_result = display_handle.await;
+        let display_result = match display_result {
+            Ok(inner) => inner,
+            Err(err) => return Err(anyhow!("display task failed: {err}")),
+        };
+
+        display_result?;
+
+        result.map_err(|err| anyhow!(err))?;
+        Ok(())
     })
     .context("running benchmark")?;
 
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DisplayMode {
+    Tui,
+    Progress,
+}
+
+fn resolve_display_mode(tui: bool, no_tui: bool) -> Result<DisplayMode> {
+    if no_tui {
+        return Ok(DisplayMode::Progress);
+    }
+
+    if tui {
+        if TuiDisplay::is_supported() {
+            return Ok(DisplayMode::Tui);
+        }
+        return Err(anyhow!(
+            "TUI requested but stdout is not a TTY or TERM is unsupported"
+        ));
+    }
+
+    if TuiDisplay::is_supported() {
+        Ok(DisplayMode::Tui)
+    } else {
+        Ok(DisplayMode::Progress)
+    }
 }
 
 /// Handle shutdown signals (SIGINT/SIGTERM).
